@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """Applies or removes config on Cisco NX-OS for RoCEv2 traffic.
-Must run directly on the switch, like:
+Can run directly on the switch, like:
 n9k# python3 bootflash:roce_enable.py
+Or remotely on a Linux machine, like:
+python3 roce_enable.py --switch-file nexus_switches.txt
 """
 
 __author__ = "Paresh Gupta"
-__version__ = "0.22"
+__version__ = "0.30"
 __updated__ = "27-Mar-2026-8-PM-PDT"
 
 import sys
 import argparse
 from collections import OrderedDict
-from cli import cli
-
+import subprocess
 
 def parse_cmdline_arguments():
     desc_str = (
@@ -87,33 +88,112 @@ def parse_cmdline_arguments():
         action="store_true",
         help="Only print the config. Do not apply.",
     )
+    parser.add_argument(
+        "--host",
+        choices=["auto", "nxos", "linux"],
+        default="auto",
+        help="Execution host: auto-detect (default), force nxos, or force linux.",
+    )
+    parser.add_argument(
+        "--switch-file",
+        type=str,
+        default="",
+        help=(
+            "File containing list of switches in format: IP,user,password,..."
+            "Mandatory when running remotely from Linux machine"
+        ),
+    )
 
     return parser.parse_args()
 
+def get_switches(args, switch_dict):
+    """
+    Parse the input-file
+
+    The format of the file is expected to carry:
+    IP_Address,username,password,description
+    Only one entry is expected per line
+    Line with prefix # is ignored
+    """
+
+    with open(args.switch_file, 'r') as f:
+        for line in f:
+            if not line.startswith('#'):
+                line = line.strip()
+                if line.startswith('['):
+                    if not line.endswith(']'):
+                        print('Input file format error. Line starts' \
+                              ' with [ but does not end with ]. File:' + \
+                              args.switch_file + '. Line:' + line)
+                        sys.exit()
+                    line = line.replace('[', '')
+                    line = line.replace(']', '')
+                    line = line.strip()
+                    continue
+
+                sw = line.split(',')
+                if len(sw) < 3:
+                    print(f'ERROR: Line not in correct input format:'
+                    'IP_Address,username,password')
+                    continue
+                switch_dict[sw[0]] = {}
+                switch_dscr = sw[3] if len(sw) == 4 else ''
+                switch_dict[sw[0]]['meta'] = [sw[1], sw[2], switch_dscr]
+
+    if not switch_dict:
+        print('ERROR: No switches found. Check input file.')
+        sys.exit()
+
+def detect_host_os(host):
+    """Detect NX-OS vs Linux."""
+    if host == "nxos":
+        import cli
+        return "nxos"
+    if host == "linux":
+        return "linux"
+
+    # auto
+    try:
+        import cli
+        cli.cli("show clock")
+        return "nxos"
+    except Exception:
+        return "linux"
 
 def normalize_cli_blob(blob):
     """Normalize multiline CLI text into single-line ' ; ' separated commands."""
     lines = [line.strip() for line in blob.splitlines() if line.strip()]
     return " ; ".join(lines)
 
+def run_cmd(args, nxos_cmd, host_os, switch_ip, switchuser):
+    """Execute CLI commands."""
+    compact = normalize_cli_blob(nxos_cmd)
+    ret = None
 
-def run_or_print(commands_blob, print_only=False):
-    """Print or execute CLI commands."""
-    pretty = commands_blob.strip()
-    compact = normalize_cli_blob(commands_blob)
+    if host_os == 'nxos':
+        try:
+            import cli
+            ret = cli.cli(compact)
+        except Exception as exc:
+            raise RuntimeError(f"CLI -{nxos_cmd}- execution failed: {exc}")
+    if host_os == 'linux':
+        cmd = 'ssh ' + switchuser + '@' + switch_ip + ' -o BatchMode=yes ' + \
+              '-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new'
+        cmd_list = cmd.split(' ')
+        cmd_list.append(compact)
+        try:
+            output = subprocess.run(cmd_list, stdout=subprocess.PIPE, \
+                        stderr=subprocess.PIPE, timeout=60)
+            if output.returncode != 0:
+                print(nxos_cmd + ' failed on ' + switch_ip + ':' + \
+                        str(output.stderr.decode('utf-8').strip()))
+            else:
+                ret = str(output.stdout.decode('utf-8').strip())
+        except Exception as e:
+            raise Exception(e)
+    return ret
 
-    if print_only:
-        print(pretty)
-        print("\n" + compact)
-        return
-
-    try:
-        cli(compact)
-    except Exception as exc:
-        raise RuntimeError(f"CLI execution failed: {exc}") from exc
-
-
-def build_interface_range(args):
+def build_interface_range(args, host_os, switch_ip, switchuser):
     """Return interface range string in grouped form:
     Eth1/1/1-2,Eth1/2/1-2,...
     """
@@ -125,16 +205,13 @@ def build_interface_range(args):
             sys.exit(0)
         return result
 
-    command = (
-        "sh int bri | begin ignore-case Interface | "
+    nxos_cmd = "sh int bri | begin ignore-case Interface | " + \
         "cut -d ' ' -f 1 | inc ignore-case Eth"
-    )
 
-    try:
-        output = cli(command)
-    except Exception as exc:
-        print(f"Failed to run show interface command: {exc}")
-        sys.exit(1)
+    output = run_cmd(args, nxos_cmd, host_os, switch_ip, switchuser)
+    if output is None:
+        print('Error: ' + nxos_cmd)
+        sys.exit()
 
     grouped = OrderedDict()
 
@@ -173,7 +250,7 @@ def build_interface_range(args):
     return result
 
 
-def apply_config(args):
+def apply_config(args, host_os, switch_ip, switchuser):
     qos_commands = f"""
 conf
 priority-flow-control watch-dog-interval on
@@ -221,7 +298,7 @@ system qos
   service-policy type network-qos qos_network
 """
 
-    intf_range = build_interface_range(args)
+    intf_range = build_interface_range(args, host_os, switch_ip, switchuser)
     intf_commands = f"""
 interface {intf_range}
 priority-flow-control mode on
@@ -234,17 +311,20 @@ end
 
     commands = qos_commands + "\n" + intf_commands
 
+    if args.print_only:
+        print(commands.strip())
+        print("\n" + normalize_cli_blob(commands))
+        return
+
     try:
-        run_or_print(commands, print_only=args.print_only)
-        if not args.print_only:
-            print("Successfully applied configuration")
+        run_cmd(args, commands, host_os, switch_ip, switchuser)
+        print("Successfully applied configuration")
     except Exception as exc:
         print(f"Failed to apply configuration: {exc}")
         sys.exit(1)
 
-
-def remove_config(args):
-    intf_range = build_interface_range(args)
+def remove_config(args, host_os, switch_ip, switchuser):
+    intf_range = build_interface_range(args, host_os, switch_ip, switchuser)
     intf_commands = f"""
 conf
 interface {intf_range}
@@ -262,7 +342,8 @@ system qos
     sys_qos_queuing = "service-policy type queuing output QOS_EGRESS_PORT"
     c_queuing = f'sh run | section "system qos" | inc "{sys_qos_queuing}"'
     try:
-        if cli(c_queuing).strip() == sys_qos_queuing:
+        if run_cmd(args, c_queuing, host_os, switch_ip, switchuser).strip() \
+                == sys_qos_queuing:
             qos_commands += f"no {sys_qos_queuing}\n"
     except Exception:
         pass
@@ -270,7 +351,8 @@ system qos
     sys_qos_network = "service-policy type network-qos qos_network"
     c_network = f'sh run | section "system qos" | inc "{sys_qos_network}"'
     try:
-        if cli(c_network).strip() == sys_qos_network:
+        if run_cmd(args, c_network, host_os, switch_ip, switchuser).strip() \
+                == sys_qos_network:
             qos_commands += f"no {sys_qos_network}\n"
     except Exception:
         pass
@@ -287,18 +369,46 @@ end
 
     commands = intf_commands + "\n" + qos_commands
 
+    if args.print_only:
+        print(commands.strip())
+        print("\n" + normalize_cli_blob(commands))
+        return
+
     try:
-        run_or_print(commands, print_only=args.print_only)
-        if not args.print_only:
-            print("Successfully removed configuration")
+        run_cmd(args, commands, host_os, switch_ip, switchuser)
+        print("Successfully removed configuration")
     except Exception as exc:
         print(f"Failed to remove configuration: {exc}")
         sys.exit(1)
 
+def change_config(args, host_os, switch_ip, switchuser):
+    if args.disable:
+        remove_config(args, host_os, switch_ip, switchuser)
+    else:
+        apply_config(args, host_os, switch_ip, switchuser)
+
+def main():
+    args = parse_cmdline_arguments()
+    host_os = detect_host_os(args.host)
+    if host_os == 'linux' and args.switch_file == '':
+        print(f"ERROR: A file with a list of switches is mandatory when running remotely")
+        sys.exit(1)
+
+    if host_os == 'linux':
+        switch_dict = {}
+        get_switches(args, switch_dict)
+        for switch_ip, switch_attr in switch_dict.items():
+            switchuser = switch_attr['meta'][0]
+            switchpassword = switch_attr['meta'][1]
+            print('----------------------------------------')
+            print(f"INFO: Starting to work on the switch {switch_ip} ({switch_attr['meta'][2]})")
+            change_config(args, host_os, switch_ip, switchuser)
+            print(f"INFO: Done working on {switch_ip} ({switch_attr['meta'][2]})")
+        print('----------------------------------------')
+    elif host_os == 'nxos':
+        change_config(args, host_os, None, None)
+    else:
+        print(f"ERROR: Unknown host OS")
 
 if __name__ == "__main__":
-    ARGS = parse_cmdline_arguments()
-    if ARGS.disable:
-        remove_config(ARGS)
-    else:
-        apply_config(ARGS)
+    main()
