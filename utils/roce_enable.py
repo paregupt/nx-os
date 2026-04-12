@@ -7,13 +7,14 @@ python3 roce_enable.py --switch-file nexus_switches.txt
 """
 
 __author__ = "Paresh Gupta"
-__version__ = "0.30"
+__version__ = "0.31"
 __updated__ = "27-Mar-2026-8-PM-PDT"
 
 import sys
 import argparse
-from collections import OrderedDict
 import subprocess
+import re
+from collections import defaultdict
 
 def parse_cmdline_arguments():
     desc_str = (
@@ -170,6 +171,7 @@ def run_cmd(args, nxos_cmd, host_os, switch_ip, switchuser):
     compact = normalize_cli_blob(nxos_cmd)
     ret = None
 
+    print(f"INFO: Trying to run: -{nxos_cmd}")
     if host_os == 'nxos':
         try:
             import cli
@@ -193,17 +195,56 @@ def run_cmd(args, nxos_cmd, host_os, switch_ip, switchuser):
             raise Exception(e)
     return ret
 
-def build_interface_range(args, host_os, switch_ip, switchuser):
-    """Return interface range string in grouped form:
-    Eth1/1/1-2,Eth1/2/1-2,...
+def parse_interface_name(if_name):
     """
-    # If user provided --intf, honor it directly.
-    if args.intf.strip():
-        result = args.intf.strip()
-        if args.print_intf:
-            print(result)
-            sys.exit(0)
-        return result
+    Parse interface name into prefix and list of numeric components.
+    Examples:
+    - eth1/1 -> prefix='eth', nums=[1,1]
+    - eth1/1/1 -> prefix='eth', nums=[1,1,1]
+    """
+    match = re.match(r"([a-zA-Z]+)([\d/]+)", if_name)
+    if not match:
+        return None, []
+    prefix = match.group(1)
+    nums = list(map(int, match.group(2).split('/')))
+    return prefix, nums
+
+def generate_ranges(nums_list):
+    """
+    Given a sorted list of integers, generate ranges as tuples (start, end).
+    Consecutive numbers are grouped into ranges.
+    """
+    ranges = []
+    start = prev = nums_list[0]
+    for num in nums_list[1:]:
+        if num == prev + 1:
+            prev = num
+        else:
+            ranges.append((start, prev))
+            start = prev = num
+    ranges.append((start, prev))
+    return ranges
+
+def format_range(prefix, base_nums, ranges):
+    """
+    Format the interface range string based on prefix, base numbers, and ranges.
+    base_nums: list of numbers except the last component
+    ranges: list of (start, end) tuples for the last component
+    """
+    base_str = '/'.join(str(n) for n in base_nums)
+    parts = []
+    for start, end in ranges:
+        if start == end:
+            parts.append(f"{prefix}{base_str}/{start}")
+        else:
+            parts.append(f"{prefix}{base_str}/{start}-{end}")
+    return ','.join(parts)
+
+def build_interface_range(args, host_os, switch_ip, switchuser):
+    """
+    Generate interface range string from a list of interface names.
+    Supports interfaces with 2 or 3 numeric components.
+    """
 
     nxos_cmd = "sh int bri | begin ignore-case Interface | " + \
         "cut -d ' ' -f 1 | inc ignore-case Eth"
@@ -212,45 +253,30 @@ def build_interface_range(args, host_os, switch_ip, switchuser):
     if output is None:
         print('Error: ' + nxos_cmd)
         sys.exit()
+    interface_list = output.split('\n')
 
-    grouped = OrderedDict()
-
-    for raw in output.strip().splitlines():
-        line = raw.strip()
-        if not line or "/" not in line:
+    # Group interfaces by prefix and base numbers (all but last number)
+    groups = defaultdict(list)
+    for if_name in interface_list:
+        prefix, nums = parse_interface_name(if_name)
+        if prefix is None or not nums:
             continue
-        if not line.lower().startswith("eth"):
-            continue
+        base = tuple(nums[:-1])  # all but last number
+        last_num = nums[-1]
+        groups[(prefix, base)].append(last_num)
 
-        parts = line.split("/")
-        # Expect at least EthX/Y/Z style.
-        if len(parts) < 3:
-            # Keep as-is for safety if format is shorter than expected.
-            grouped.setdefault(line, line)
-            continue
+    # For each group, generate ranges and format
+    range_strings = []
+    for (prefix, base), last_nums in groups.items():
+        sorted_nums = sorted(last_nums)
+        ranges = generate_ranges(sorted_nums)
+        range_str = format_range(prefix, list(base), ranges)
+        range_strings.append(range_str)
 
-        key = "/".join(parts[:2])  # before second '/'
-        last = parts[-1]           # after last '/'
-
-        if key not in grouped:
-            grouped[key] = line
-        else:
-            grouped[key] += f"-{last}"
-
-    result = ",".join(grouped.values())
-
-    if not result:
-        print("No Ethernet interfaces discovered. Exiting.")
-        sys.exit(1)
-
-    if args.print_intf:
-        print(result)
-        sys.exit(0)
-
-    return result
-
+    return ','.join(range_strings)
 
 def apply_config(args, host_os, switch_ip, switchuser):
+    print(f"INFO: Trying to apply config...")
     qos_commands = f"""
 conf
 priority-flow-control watch-dog-interval on
@@ -299,6 +325,11 @@ system qos
 """
 
     intf_range = build_interface_range(args, host_os, switch_ip, switchuser)
+    if args.print_intf:
+        print(f"INFO: Printing only interface range:")
+        print(intf_range)
+        return
+
     intf_commands = f"""
 interface {intf_range}
 priority-flow-control mode on
@@ -325,6 +356,11 @@ end
 
 def remove_config(args, host_os, switch_ip, switchuser):
     intf_range = build_interface_range(args, host_os, switch_ip, switchuser)
+    if args.print_intf:
+        print(f"INFO: Printing only interface range:")
+        print(intf_range)
+        return
+
     intf_commands = f"""
 conf
 interface {intf_range}
