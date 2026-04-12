@@ -8,7 +8,7 @@ python3 roce_enable.py --switch-file nexus_switches.txt
 
 __author__ = "Paresh Gupta"
 __version__ = "0.31"
-__updated__ = "27-Mar-2026-8-PM-PDT"
+__updated__ = "12-Apr-2026-1-PM-PDT"
 
 import sys
 import argparse
