@@ -11,101 +11,9 @@ __version__ = "0.31"
 __updated__ = "12-Apr-2026-1-PM-PDT"
 
 import sys
-import argparse
 import subprocess
 import re
 from collections import defaultdict
-
-def parse_cmdline_arguments():
-    desc_str = (
-        "Apply NX-OS Modular Quality of Service (QoS) Command-Line Interface\n"
-        "(CLI) (MQC) for handling RoCEv2 traffic. This is a wrapper\n"
-        "for applying PFC and ECN config. It covers the most common\n"
-        "scenario, but not all cases. For customization, change this\n"
-        "script, use the options below, or use NX-OS CLI directly.\n"
-        f"V:{__version__} ({__updated__})"
-    )
-
-    parser = argparse.ArgumentParser(
-        description=desc_str,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-
-    parser.add_argument(
-        "--pfc-cos",
-        dest="pfc_cos",
-        type=str,
-        default="3",
-        help=(
-            "List of class-of-service values for Pause frame, used by "
-            "'pause pfc-cos <...>'. Default: 3"
-        ),
-    )
-    parser.add_argument(
-        "--cnp-dscp",
-        dest="cnp_dscp",
-        type=str,
-        default="48",
-        help=(
-            "List of DSCP values for identifying CNP and assigning to "
-            "priority queue. Default: 48"
-        ),
-    )
-    parser.add_argument(
-        "--roce-dscp",
-        dest="roce_dscp",
-        type=str,
-        default="24-31",
-        help=(
-            "List of DSCP values for identifying RoCE traffic and assigning "
-            "to no-drop queue. Default: 24-31"
-        ),
-    )
-    parser.add_argument(
-        "--intf",
-        type=str,
-        default="",
-        help=(
-            "Interfaces to be applied with RoCE and CNP classification policy. "
-            "Must be in NX-OS interface range format. "
-            "Default: all Eth interfaces."
-        ),
-    )
-    parser.add_argument(
-        "--print-intf",
-        default=False,
-        action="store_true",
-        help="Print all interface range. Do not apply config.",
-    )
-    parser.add_argument(
-        "--disable",
-        default=False,
-        action="store_true",
-        help="Remove config applied by this utility.",
-    )
-    parser.add_argument(
-        "--print-only",
-        default=False,
-        action="store_true",
-        help="Only print the config. Do not apply.",
-    )
-    parser.add_argument(
-        "--host",
-        choices=["auto", "nxos", "linux"],
-        default="auto",
-        help="Execution host: auto-detect (default), force nxos, or force linux.",
-    )
-    parser.add_argument(
-        "--switch-file",
-        type=str,
-        default="",
-        help=(
-            "File containing list of switches in format: IP,user,password,..."
-            "Mandatory when running remotely from Linux machine"
-        ),
-    )
-
-    return parser.parse_args()
 
 def get_switches(args, switch_dict):
     """
@@ -134,7 +42,7 @@ def get_switches(args, switch_dict):
 
                 sw = line.split(',')
                 if len(sw) < 3:
-                    print(f'ERROR: Line not in correct input format:'
+                    print('ERROR: Line not in correct input format:'
                     'IP_Address,username,password')
                     continue
                 switch_dict[sw[0]] = {}
@@ -171,7 +79,6 @@ def run_cmd(args, nxos_cmd, host_os, switch_ip, switchuser):
     compact = normalize_cli_blob(nxos_cmd)
     ret = None
 
-    print(f"INFO: Trying to run: -{nxos_cmd}")
     if host_os == 'nxos':
         try:
             import cli
@@ -276,7 +183,7 @@ def build_interface_range(args, host_os, switch_ip, switchuser):
     return ','.join(range_strings)
 
 def apply_config(args, host_os, switch_ip, switchuser):
-    print(f"INFO: Trying to apply config...")
+    print("INFO: Trying to apply config...")
     qos_commands = f"""
 conf
 priority-flow-control watch-dog-interval on
@@ -326,7 +233,7 @@ system qos
 
     intf_range = build_interface_range(args, host_os, switch_ip, switchuser)
     if args.print_intf:
-        print(f"INFO: Printing only interface range:")
+        print("INFO: Printing only interface range:")
         print(intf_range)
         return
 
@@ -357,7 +264,7 @@ end
 def remove_config(args, host_os, switch_ip, switchuser):
     intf_range = build_interface_range(args, host_os, switch_ip, switchuser)
     if args.print_intf:
-        print(f"INFO: Printing only interface range:")
+        print("INFO: Printing only interface range:")
         print(intf_range)
         return
 
@@ -417,34 +324,8 @@ end
         print(f"Failed to remove configuration: {exc}")
         sys.exit(1)
 
-def change_config(args, host_os, switch_ip, switchuser):
-    if args.disable:
-        remove_config(args, host_os, switch_ip, switchuser)
-    else:
-        apply_config(args, host_os, switch_ip, switchuser)
-
 def main():
-    args = parse_cmdline_arguments()
-    host_os = detect_host_os(args.host)
-    if host_os == 'linux' and args.switch_file == '':
-        print(f"ERROR: A file with a list of switches is mandatory when running remotely")
-        sys.exit(1)
-
-    if host_os == 'linux':
-        switch_dict = {}
-        get_switches(args, switch_dict)
-        for switch_ip, switch_attr in switch_dict.items():
-            switchuser = switch_attr['meta'][0]
-            switchpassword = switch_attr['meta'][1]
-            print('----------------------------------------')
-            print(f"INFO: Starting to work on the switch {switch_ip} ({switch_attr['meta'][2]})")
-            change_config(args, host_os, switch_ip, switchuser)
-            print(f"INFO: Done working on {switch_ip} ({switch_attr['meta'][2]})")
-        print('----------------------------------------')
-    elif host_os == 'nxos':
-        change_config(args, host_os, None, None)
-    else:
-        print(f"ERROR: Unknown host OS")
+    pass
 
 if __name__ == "__main__":
     main()
