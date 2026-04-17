@@ -7,11 +7,13 @@ python3 roce_enable.py --switch-file nexus_switches.txt
 """
 
 __author__ = "Paresh Gupta"
-__version__ = "0.40"
+__version__ = "0.50"
 __updated__ = "17-Apr-2026-1-PM-PDT"
 
 import sys
 import argparse
+import time
+import concurrent.futures
 from utils import nxos_utils
 
 def parse_cmdline_arguments():
@@ -188,9 +190,8 @@ end
         return
 
     try:
-        print("INFO: Trying to apply config...")
+        print(f"INFO: Switch: {switch_ip}: Trying to apply config...")
         nxos_utils.run_cmd(args, commands, host_os, switch_ip, switchuser)
-        print("INFO: Successfully applied configuration")
     except Exception as exc:
         print(f"Failed to apply configuration: {exc}")
         return
@@ -258,18 +259,19 @@ end
         return
 
     try:
-        print("INFO: Trying to remove config...")
+        print(f"INFO: Switch: {switch_ip}: Trying to remove config...")
         nxos_utils.run_cmd(args, commands, host_os, switch_ip, switchuser)
-        print("INFO: Successfully removed configuration")
     except Exception as exc:
         print(f"Failed to remove configuration: {exc}")
         return
 
 def change_config(args, host_os, switch_ip, switchuser):
+    start_t = time.time()
     if args.disable:
         remove_config(args, host_os, switch_ip, switchuser)
     else:
         apply_config(args, host_os, switch_ip, switchuser)
+    print(f"INFO: Switch: {switch_ip} took {round((time.time() - start_t), 2)}s")
 
 
 def main():
@@ -279,21 +281,35 @@ def main():
         print("ERROR: A file with a list of switches is mandatory when running remotely")
         sys.exit(1)
 
+    start_t = time.time()
+    print('--------------------------------------------------------------------------------')
     if host_os == 'linux':
         switch_dict = {}
         nxos_utils.get_switches(args, switch_dict)
-        for switch_ip, switch_attr in switch_dict.items():
-            switchuser = switch_attr['meta'][0]
-            switchpassword = switch_attr['meta'][1]
-            print('--------------------------------------------------------------------------------')
-            print(f"INFO: Starting to work on the switch {switch_ip} ({switch_attr['meta'][2]})")
-            change_config(args, host_os, switch_ip, switchuser)
-            print(f"INFO: Done working on {switch_ip} ({switch_attr['meta'][2]})")
-        print('--------------------------------------------------------------------------------') 
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(switch_dict)) as e:
+            futures = {}
+            for switch_ip, switch_attr in switch_dict.items():
+                switchuser = switch_attr['meta'][0]
+                switchpassword = switch_attr['meta'][1]
+                print(f"INFO: Switch: {switch_ip} ({switch_attr['meta'][2]}): Starting to work...")
+                future = e.submit(change_config, args, host_os, switch_ip, switchuser)
+                futures[future] = switch_ip
+
+            for future in concurrent.futures.as_completed(futures):
+                switch_ip = futures[future]
+                try:
+                    result = future.result()  # This will raise any exception that occurred
+                    print(f"INFO: Switch: {switch_ip}: Completed successfully")
+                except Exception as exc:
+                    print(f"Switch: {switch_ip}: Generated an exception: {exc}")
+
     elif host_os == 'nxos':
-        change_config(args, host_os, None, None)
+        change_config(args, host_os, 'local', None)
     else:
         print("ERROR: Unknown host OS")
+    print('--------------------------------------------------------------------------------')
+    print(f"INFO: Total time: {round((time.time() - start_t), 2)}s")
 
 if __name__ == "__main__":
     main()
