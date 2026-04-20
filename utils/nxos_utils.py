@@ -13,7 +13,15 @@ __updated__ = "12-Apr-2026-1-PM-PDT"
 import sys
 import subprocess
 import re
+import time
+import json
+from collections import deque
 from collections import defaultdict
+
+# Constants for Regex Patterns
+CDP_IP_REGEX = re.compile(r"address:\s*(\d{1,3}(?:\.\d{1,3}){3})", re.IGNORECASE)
+LLDP_IP_REGEX = re.compile(r"Address:\s*(\d{1,3}(?:\.\d{1,3}){3})", re.IGNORECASE)
+HOSTNAME_REGEX = re.compile(r"System Name:\s*(\S+)|Device ID:\s*(\S+)", re.IGNORECASE)
 
 def get_switches(args, switch_dict):
     """
@@ -182,147 +190,96 @@ def build_interface_range(args, host_os, switch_ip, switchuser):
 
     return ','.join(range_strings)
 
-def apply_config(args, host_os, switch_ip, switchuser):
-    print("INFO: Trying to apply config...")
-    qos_commands = f"""
-conf
-priority-flow-control watch-dog-interval on
-policy-map type network-qos qos_network
-  class type network-qos c-8q-nq3
-    mtu 9216
-    pause pfc-cos {args.pfc_cos}
-  class type network-qos c-8q-nq-default
-    mtu 9216
-    exit
-  exit
-class-map type qos match-any CNP
-  match dscp {args.cnp_dscp}
-class-map type qos match-any ROCEv2
-  match dscp {args.roce_dscp}
-policy-map type qos QOS_CLASSIFICATION
-  class ROCEv2
-    set qos-group 3
-  class CNP
-    set qos-group 7
-  class class-default
-    set qos-group 0
-    exit
-  exit
-policy-map type queuing QOS_EGRESS_PORT
-  class type queuing c-out-8q-q6
-    bandwidth remaining percent 0
-  class type queuing c-out-8q-q5
-    bandwidth remaining percent 0
-  class type queuing c-out-8q-q4
-    bandwidth remaining percent 0
-  class type queuing c-out-8q-q3
-    bandwidth remaining percent 50
-    random-detect minimum-threshold 950 kbytes maximum-threshold 3000 kbytes drop-probability 7 weight 0 ecn
-  class type queuing c-out-8q-q2
-    bandwidth remaining percent 0
-  class type queuing c-out-8q-q1
-    bandwidth remaining percent 0
-  class type queuing c-out-8q-q-default
-    bandwidth remaining percent 50
-  class type queuing c-out-8q-q7
-    priority level 1
-system qos
-  service-policy type queuing output QOS_EGRESS_PORT
-  service-policy type network-qos qos_network
-"""
+def parse_neighbors(output, ip_regex):
+    """Parse CLI output to extract neighbor IP addresses."""
+    neighbors = set()
+    matches = ip_regex.findall(output)
+    for match in matches:
+        neighbors.add(match)
+    return neighbors
 
-    intf_range = build_interface_range(args, host_os, switch_ip, switchuser)
-    if args.print_intf:
-        print("INFO: Printing only interface range:")
-        print(intf_range)
-        return
+def discover_fabric(args, host_os, switch_ip, switchuser, max_depth=5):
+    """Discover the NX-OS fabric using BFS."""
+    visited = set()
+    queue = deque([(switch_ip, 0)]) # Tuple of (IP, current_depth)
+    topology = {}
 
-    intf_commands = f"""
-interface {intf_range}
-priority-flow-control mode on
-priority-flow-control watch-dog-interval on
-mtu 9216
-service-policy type qos input QOS_CLASSIFICATION
-no shutdown
-end
-"""
+    print(f"--- Starting Fabric Discovery from Seed: {switch_ip} ---")
 
-    commands = qos_commands + "\n" + intf_commands
+    while queue:
+        current_ip, depth = queue.popleft()
 
-    if args.print_only:
-        print(commands.strip())
-        print("\n" + normalize_cli_blob(commands))
-        return
+        if current_ip in visited:
+            continue
+        if depth > max_depth:
+            print(f"Reached max depth ({max_depth}) at {current_ip}. Skipping.")
+            continue
 
-    try:
-        run_cmd(args, commands, host_os, switch_ip, switchuser)
-        print("Successfully applied configuration")
-    except Exception as exc:
-        print(f"Failed to apply configuration: {exc}")
-        sys.exit(1)
+        visited.add(current_ip)
+        print(f"[{depth}/{max_depth}] Connecting to {current_ip}...")
 
-def remove_config(args, host_os, switch_ip, switchuser):
-    intf_range = build_interface_range(args, host_os, switch_ip, switchuser)
-    if args.print_intf:
-        print("INFO: Printing only interface range:")
-        print(intf_range)
-        return
+        try:
+            # Get Hostname
+            output = run_cmd(args, 'show hostname', host_os, current_ip, switchuser)
+            if output is None:
+                print(f"Error: Unable to get hostname from {switch_ip}")
+                continue
+            hostname = output
 
-    intf_commands = f"""
-conf
-interface {intf_range}
-no priority-flow-control mode on
-no priority-flow-control watch-dog-interval on
-no service-policy type qos input QOS_CLASSIFICATION
-exit
-"""
+            # Run CDP and LLDP commands
+            cdp_cmd = "show cdp neighbors detail"
+            cdp_out = run_cmd(args, cdp_cmd, host_os, current_ip, switchuser)
+            if cdp_out is None:
+                print(f"Error: Unable to get {cdp_cmd} from {switch_ip}")
+                continue
 
-    qos_commands = """
-no priority-flow-control watch-dog-interval on
-system qos
-"""
+            lldp_cmd = "show lldp neighbors detail"
+            lldp_out = run_cmd(args, lldp_cmd, host_os, current_ip, switchuser)
+            if lldp_out is None:
+                print(f"Error: Unable to get {lldp_cmd} from {switch_ip}")
+                continue
 
-    sys_qos_queuing = "service-policy type queuing output QOS_EGRESS_PORT"
-    c_queuing = f'sh run | section "system qos" | inc "{sys_qos_queuing}"'
-    try:
-        if run_cmd(args, c_queuing, host_os, switch_ip, switchuser).strip() \
-                == sys_qos_queuing:
-            qos_commands += f"no {sys_qos_queuing}\n"
-    except Exception:
-        pass
+            # Extract neighbor IPs
+            cdp_neighbors = parse_neighbors(cdp_out, CDP_IP_REGEX)
+            lldp_neighbors = parse_neighbors(lldp_out, LLDP_IP_REGEX)
 
-    sys_qos_network = "service-policy type network-qos qos_network"
-    c_network = f'sh run | section "system qos" | inc "{sys_qos_network}"'
-    try:
-        if run_cmd(args, c_network, host_os, switch_ip, switchuser).strip() \
-                == sys_qos_network:
-            qos_commands += f"no {sys_qos_network}\n"
-    except Exception:
-        pass
+            # Combine unique neighbors
+            all_neighbors = list(cdp_neighbors.union(lldp_neighbors))
 
-    qos_commands += """
-exit
-no policy-map type queuing QOS_EGRESS_PORT
-no policy-map type network-qos qos_network
-no policy-map type qos QOS_CLASSIFICATION
-no class-map type qos match-any CNP
-no class-map type qos match-any ROCEv2
-end
-"""
+            # Remove self-IP if it somehow shows up
+            if current_ip in all_neighbors:
+                all_neighbors.remove(current_ip)
 
-    commands = intf_commands + "\n" + qos_commands
+            # Record in topology
+            topology[current_ip] = {
+                "hostname": hostname,
+                "depth": depth,
+                "neighbors": all_neighbors,
+                "status": "success"
+            }
 
-    if args.print_only:
-        print(commands.strip())
-        print("\n" + normalize_cli_blob(commands))
-        return
+            # Add new neighbors to the queue
+            for neighbor_ip in all_neighbors:
+                if neighbor_ip not in visited:
+                    queue.append((neighbor_ip, depth + 1))
 
-    try:
-        run_cmd(args, commands, host_os, switch_ip, switchuser)
-        print("Successfully removed configuration")
-    except Exception as exc:
-        print(f"Failed to remove configuration: {exc}")
-        sys.exit(1)
+        except Exception as e:
+            print(f"Error: An unexpected error occurred on {current_ip}: {e}")
+
+    return topology
+
+def discover_fabric_topology(args, host_os, switch_ip, switchuser):
+    fabric_topology = discover_fabric(args, host_os, switch_ip, switchuser, max_depth=5)
+    time_str = time.strftime("%Y-%m-%d-%H-%M-%S")
+    output_filename = "nxos_fabric_topology_" + time_str + ".json"
+    print(f"\n--- Discovery Complete. Saving to {output_filename} ---")
+
+    with open(output_filename, 'w') as f:
+        json.dump(fabric_topology, f, indent=4)
+
+    print(json.dumps(fabric_topology, indent=4))
+
+    return fabric_topology
 
 def main():
     pass

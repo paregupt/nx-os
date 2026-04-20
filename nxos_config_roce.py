@@ -32,6 +32,15 @@ def parse_cmdline_arguments():
     )
 
     parser.add_argument(
+        "--switch-file",
+        type=str,
+        default="",
+        help=(
+            "File containing list of switches in format: IP,user,password,..."
+            "Mandatory when running remotely from Linux machine"
+        ),
+    )
+    parser.add_argument(
         "--pfc-cos",
         dest="pfc_cos",
         type=str,
@@ -96,13 +105,13 @@ def parse_cmdline_arguments():
         help="Execution host: auto-detect (default), force nxos, or force linux.",
     )
     parser.add_argument(
-        "--switch-file",
-        type=str,
-        default="",
-        help=(
-            "File containing list of switches in format: IP,user,password,..."
-            "Mandatory when running remotely from Linux machine"
-        ),
+        "--fabric",
+        default=False,
+        action="store_true",
+        help="Use the seed switch from the provided switch-file to discover "
+        "all switches in the fabric and then make change on all the switches. "
+        "The other approach would be to provide all switches in the switch-file"
+        " without this option set",
     )
 
     return parser.parse_args()
@@ -178,7 +187,7 @@ end
     commands = qos_commands + intf_commands
 
     if args.print_only:
-        print("INFO: Following is the config in pretty format:\n")
+        print(f"INFO: Switch: {switch_ip}: Following is the config in pretty format:\n")
         print("+++")
         print(commands.strip())
         print("+++")
@@ -247,7 +256,7 @@ end
     commands = intf_commands + qos_commands
 
     if args.print_only:
-        print("INFO: Following is the config in pretty format:\n")
+        print(f"INFO: Switch: {switch_ip}: Following is the config in pretty format:\n")
         print("+++")
         print(commands.strip())
         print("+++")
@@ -286,6 +295,20 @@ def main():
     if host_os == 'linux':
         switch_dict = {}
         nxos_utils.get_switches(args, switch_dict)
+
+        # Discover the fabric using seed switch from the provided switch-file
+        if args.fabric:
+            discovered_switch_dict = {}
+            for switch_ip, switch_attr in switch_dict.items():
+                switchuser = switch_attr['meta'][0]
+                fabric_topology = nxos_utils.discover_fabric_topology(args, \
+                                                host_os, switch_ip, switchuser)
+                for switch_ip, switch_attr in fabric_topology.items():
+                    discovered_switch_dict[switch_ip] = {}
+                    # use the same user as seed switch, blank passwd
+                    discovered_switch_dict[switch_ip]['meta'] = [switchuser, '', \
+                                                      switch_attr['hostname']]
+            switch_dict.update(discovered_switch_dict)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(switch_dict)) as e:
             futures = {}
