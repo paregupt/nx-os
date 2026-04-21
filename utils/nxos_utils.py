@@ -16,6 +16,7 @@ import re
 import time
 import json
 import argparse
+import concurrent.futures
 from collections import deque
 from collections import defaultdict
 
@@ -82,7 +83,6 @@ def get_base_parser():
     base_parser.add_argument(
         "-v",
         "--verbose",
-        dest="verbose",
         action="store_true",
         default=False,
         help="Verbose logs"
@@ -283,13 +283,13 @@ def discover_fabric(args, host_os, switch_ip, switchuser, max_depth=5):
             continue
 
         visited.add(current_ip)
-        print(f"[{depth}/{max_depth}] Connecting to {current_ip}...")
+        print(f"[{depth}/{max_depth}] Discovering {current_ip}...")
 
         try:
             # Get Hostname
             output = run_cmd(args, 'show hostname', host_os, current_ip, switchuser)
             if output is None:
-                print(f"Error: Unable to get hostname from {switch_ip}")
+                print(f"Error: Unable to get hostname from {current_ip}")
                 continue
             hostname = output
 
@@ -339,14 +339,67 @@ def discover_fabric_topology(args, host_os, switch_ip, switchuser):
     fabric_topology = discover_fabric(args, host_os, switch_ip, switchuser, max_depth=5)
     time_str = time.strftime("%Y-%m-%d-%H-%M-%S")
     output_filename = "nxos_fabric_topology_" + time_str + ".json"
-    print(f"\n--- Discovery Complete. Saving to {output_filename} ---")
+    print(f"--- Discovery Complete ---")
 
     with open(output_filename, 'w') as f:
         json.dump(fabric_topology, f, indent=4)
 
-    print(json.dumps(fabric_topology, indent=4))
+    if args.verbose:
+        print(f"{output_filename}:")
+        print(json.dumps(fabric_topology, indent=4))
 
     return fabric_topology
+
+def common_worker(args, worker):
+    host_os = detect_host_os(args.host)
+    if host_os == 'linux' and args.switch_file == '':
+        print("ERROR: A file with a list of switches is mandatory when running remotely")
+        sys.exit(1)
+
+    start_t = time.time()
+    print('--------------------------------------------------------------------------------')
+    if host_os == 'linux':
+        switch_dict = {}
+        get_switches(args, switch_dict)
+
+        # Discover the fabric using seed switch from the provided switch-file
+        if args.fabric:
+            discovered_switch_dict = {}
+            for switch_ip, switch_attr in switch_dict.items():
+                switchuser = switch_attr['meta'][0]
+                fabric_topology = discover_fabric_topology(args, \
+                                                host_os, switch_ip, switchuser)
+                for switch_ip, switch_attr in fabric_topology.items():
+                    discovered_switch_dict[switch_ip] = {}
+                    # use the same user as seed switch, blank passwd
+                    discovered_switch_dict[switch_ip]['meta'] = [switchuser, '', \
+                                                      switch_attr['hostname']]
+            switch_dict.update(discovered_switch_dict)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(switch_dict)) as e:
+            futures = {}
+            for switch_ip, switch_attr in switch_dict.items():
+                switchuser = switch_attr['meta'][0]
+                switchpassword = switch_attr['meta'][1]
+                print(f"INFO: Switch: {switch_ip} ({switch_attr['meta'][2]}): Starting to work...")
+                future = e.submit(worker, args, host_os, switch_ip, switchuser)
+                futures[future] = switch_ip
+
+            for future in concurrent.futures.as_completed(futures):
+                switch_ip = futures[future]
+                try:
+                    result = future.result()  # This will raise any exception that occurred
+                    print(f"INFO: Switch: {switch_ip}: Completed successfully")
+                except Exception as exc:
+                    print(f"Switch: {switch_ip}: Generated an exception: {exc}")
+
+    elif host_os == 'nxos':
+        worker(args, host_os, 'local', None)
+    else:
+        print("ERROR: Unknown host OS")
+    print('--------------------------------------------------------------------------------')
+    print(f"INFO: Total time: {round((time.time() - start_t), 2)}s")
+
 
 def main():
     pass

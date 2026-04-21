@@ -13,7 +13,6 @@ __updated__ = "17-Apr-2026-1-PM-PDT"
 import sys
 import argparse
 import time
-import concurrent.futures
 from utils import nxos_utils
 
 def parse_cmdline_arguments():
@@ -136,6 +135,7 @@ end
     commands = qos_commands + intf_commands
 
     if args.print_only:
+        print('----------------------------------------')
         print(f"INFO: Switch: {switch_ip}: Following is the config in pretty format:\n")
         print("+++")
         print(commands.strip())
@@ -205,6 +205,7 @@ end
     commands = intf_commands + qos_commands
 
     if args.print_only:
+        print('----------------------------------------')
         print(f"INFO: Switch: {switch_ip}: Following is the config in pretty format:\n")
         print("+++")
         print(commands.strip())
@@ -234,54 +235,7 @@ def change_config(args, host_os, switch_ip, switchuser):
 
 def main():
     args = parse_cmdline_arguments()
-    host_os = nxos_utils.detect_host_os(args.host)
-    if host_os == 'linux' and args.switch_file == '':
-        print("ERROR: A file with a list of switches is mandatory when running remotely")
-        sys.exit(1)
-
-    start_t = time.time()
-    print('--------------------------------------------------------------------------------')
-    if host_os == 'linux':
-        switch_dict = {}
-        nxos_utils.get_switches(args, switch_dict)
-
-        # Discover the fabric using seed switch from the provided switch-file
-        if args.fabric:
-            discovered_switch_dict = {}
-            for switch_ip, switch_attr in switch_dict.items():
-                switchuser = switch_attr['meta'][0]
-                fabric_topology = nxos_utils.discover_fabric_topology(args, \
-                                                host_os, switch_ip, switchuser)
-                for switch_ip, switch_attr in fabric_topology.items():
-                    discovered_switch_dict[switch_ip] = {}
-                    # use the same user as seed switch, blank passwd
-                    discovered_switch_dict[switch_ip]['meta'] = [switchuser, '', \
-                                                      switch_attr['hostname']]
-            switch_dict.update(discovered_switch_dict)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(switch_dict)) as e:
-            futures = {}
-            for switch_ip, switch_attr in switch_dict.items():
-                switchuser = switch_attr['meta'][0]
-                switchpassword = switch_attr['meta'][1]
-                print(f"INFO: Switch: {switch_ip} ({switch_attr['meta'][2]}): Starting to work...")
-                future = e.submit(change_config, args, host_os, switch_ip, switchuser)
-                futures[future] = switch_ip
-
-            for future in concurrent.futures.as_completed(futures):
-                switch_ip = futures[future]
-                try:
-                    result = future.result()  # This will raise any exception that occurred
-                    print(f"INFO: Switch: {switch_ip}: Completed successfully")
-                except Exception as exc:
-                    print(f"Switch: {switch_ip}: Generated an exception: {exc}")
-
-    elif host_os == 'nxos':
-        change_config(args, host_os, 'local', None)
-    else:
-        print("ERROR: Unknown host OS")
-    print('--------------------------------------------------------------------------------')
-    print(f"INFO: Total time: {round((time.time() - start_t), 2)}s")
+    nxos_utils.common_worker(args, change_config)
 
 if __name__ == "__main__":
     main()
