@@ -26,20 +26,12 @@ def parse_cmdline_arguments():
         f"V:{__version__} ({__updated__})"
     )
 
-    parser = argparse.ArgumentParser(
-        description=desc_str,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    base_parser = nxos_utils.get_base_parser()
+    parser = argparse.ArgumentParser(parents=[base_parser],
+                description=desc_str,
+                formatter_class=argparse.RawDescriptionHelpFormatter,
+                )
 
-    parser.add_argument(
-        "--switch-file",
-        type=str,
-        default="",
-        help=(
-            "File containing list of switches in format: IP,user,password,..."
-            "Mandatory when running remotely from Linux machine"
-        ),
-    )
     parser.add_argument(
         "--pfc-cos",
         dest="pfc_cos",
@@ -69,49 +61,6 @@ def parse_cmdline_arguments():
             "List of DSCP values for identifying RoCE traffic and assigning "
             "to no-drop queue. Default: 24-31"
         ),
-    )
-    parser.add_argument(
-        "--intf",
-        type=str,
-        default="",
-        help=(
-            "Interfaces to be applied with RoCE and CNP classification policy. "
-            "Must be in NX-OS interface range format. "
-            "Default: all Eth interfaces."
-        ),
-    )
-    parser.add_argument(
-        "--print-intf",
-        default=False,
-        action="store_true",
-        help="Print all interface range. Do not apply config.",
-    )
-    parser.add_argument(
-        "--disable",
-        default=False,
-        action="store_true",
-        help="Remove config applied by this utility.",
-    )
-    parser.add_argument(
-        "--print-only",
-        default=False,
-        action="store_true",
-        help="Only print the config. Do not apply.",
-    )
-    parser.add_argument(
-        "--host",
-        choices=["auto", "nxos", "linux"],
-        default="auto",
-        help="Execution host: auto-detect (default), force nxos, or force linux.",
-    )
-    parser.add_argument(
-        "--fabric",
-        default=False,
-        action="store_true",
-        help="Use the seed switch from the provided switch-file to discover "
-        "all switches in the fabric and then make change on all the switches. "
-        "The other approach would be to provide all switches in the switch-file"
-        " without this option set",
     )
 
     return parser.parse_args()
