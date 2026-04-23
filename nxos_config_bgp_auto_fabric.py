@@ -13,7 +13,14 @@ __updated__ = "17-Apr-2026-1-PM-PDT"
 import sys
 import argparse
 import time
+import re
 from utils import nxos_utils
+
+SPINE_ASN=65001
+LEAF_ASN=64601
+leaf_cnt, spine_cnt = 0,0
+LEAF_LOOPBACK_PREFIX='10.0.'
+SPINE_LOOPBACK_PREFIX='10.1.'
 
 def parse_cmdline_arguments():
     desc_str = (
@@ -31,109 +38,98 @@ def parse_cmdline_arguments():
                 formatter_class=argparse.RawDescriptionHelpFormatter,
                 )
 
-    parser.add_argument(
-        "--pfc-cos",
-        dest="pfc_cos",
-        type=str,
-        default="3",
-        help=(
-            "List of class-of-service values for Pause frame, used by "
-            "'pause pfc-cos <...>'. Default: 3"
-        ),
-    )
-    parser.add_argument(
-        "--cnp-dscp",
-        dest="cnp_dscp",
-        type=str,
-        default="48",
-        help=(
-            "List of DSCP values for identifying CNP and assigning to "
-            "priority queue. Default: 48"
-        ),
-    )
-    parser.add_argument(
-        "--roce-dscp",
-        dest="roce_dscp",
-        type=str,
-        default="24-31",
-        help=(
-            "List of DSCP values for identifying RoCE traffic and assigning "
-            "to no-drop queue. Default: 24-31"
-        ),
-    )
-
     return parser.parse_args()
 
-def apply_config(args, host_os, switch_ip, switchuser):
-    qos_commands = f"""
+def assign_bgp_asn(args, fabric_topology):
+    switchname_dict = {}
+    switchname_dict['spine'] = {}
+    switchname_dict['leaf'] = {}
+    spine_dict = {}
+    leaf_dict = {}
+    for switch_ip, switch_attr in fabric_topology.items():
+        if re.search('leaf', switch_attr["hostname"], re.IGNORECASE):
+            leaf_dict[switch_attr["hostname"]] = {}
+            leaf_dict[switch_attr["hostname"]]["switch_ip"] = switch_ip
+        if re.search('spine', switch_attr["hostname"], re.IGNORECASE):
+            spine_dict[switch_attr["hostname"]] = {}
+            spine_dict[switch_attr["hostname"]]["switch_ip"] = switch_ip
+
+    switchname_dict['leaf'] = dict(sorted(leaf_dict.items()))
+    leaf_cnt = 0
+    for switch_name, switch_attr in switchname_dict['leaf'].items():
+        switch_attr["asn"] = LEAF_ASN + leaf_cnt
+        leaf_cnt = leaf_cnt + 1
+    spine_cnt = 0
+    switchname_dict['spine'] = dict(sorted(spine_dict.items()))
+    for switch_name, switch_attr in switchname_dict['spine'].items():
+        switch_attr["asn"] = SPINE_ASN + spine_cnt
+        spine_cnt = spine_cnt + 1
+
+    switchname_dict = switchname_dict['leaf'] | switchname_dict['spine']
+    return switchname_dict
+
+def apply_config(args, host_os, switch_ip, switchuser, fabric_topology, switch_asn_dict):
+    asn = 0
+    loopback_ip = ''
+    global_commands = f"""
 conf
-priority-flow-control watch-dog-interval on
-policy-map type network-qos qos_network
-  class type network-qos c-8q-nq3
-    mtu 9216
-    pause pfc-cos {args.pfc_cos}
-  class type network-qos c-8q-nq-default
-    mtu 9216
-    exit
-  exit
-class-map type qos match-any CNP
-  match dscp {args.cnp_dscp}
-class-map type qos match-any ROCEv2
-  match dscp {args.roce_dscp}
-policy-map type qos QOS_CLASSIFICATION
-  class ROCEv2
-    set qos-group 3
-  class CNP
-    set qos-group 7
-  class class-default
-    set qos-group 0
-    exit
-  exit
-policy-map type queuing QOS_EGRESS_PORT
-  class type queuing c-out-8q-q6
-    bandwidth remaining percent 0
-  class type queuing c-out-8q-q5
-    bandwidth remaining percent 0
-  class type queuing c-out-8q-q4
-    bandwidth remaining percent 0
-  class type queuing c-out-8q-q3
-    bandwidth remaining percent 50
-    random-detect minimum-threshold 950 kbytes maximum-threshold 3000 kbytes drop-probability 7 weight 0 ecn
-  class type queuing c-out-8q-q2
-    bandwidth remaining percent 0
-  class type queuing c-out-8q-q1
-    bandwidth remaining percent 0
-  class type queuing c-out-8q-q-default
-    bandwidth remaining percent 50
-  class type queuing c-out-8q-q7
-    priority level 1
-system qos
-  service-policy type queuing output QOS_EGRESS_PORT
-  service-policy type network-qos qos_network
+feature bgp
+route-map redis-map permit 10
+  match tag 12345
 """
 
-    if args.intf == "":
-        intf_range = nxos_utils.build_interface_range(args, host_os, \
-                                                      switch_ip, switchuser)
+    if re.search('leaf', fabric_topology[switch_ip]["hostname"], re.IGNORECASE):
+        loopback_ip = LEAF_LOOPBACK_PREFIX + \
+                        switch_ip.split('.')[-2] + '.' + switch_ip.split('.')[-1]
+        asn = switch_asn_dict[fabric_topology[switch_ip]["hostname"]]['asn']
+    elif re.search('spine', fabric_topology[switch_ip]["hostname"], re.IGNORECASE):
+        loopback_ip = SPINE_LOOPBACK_PREFIX + \
+                        switch_ip.split('.')[-2] + '.' + switch_ip.split('.')[-1]
+        asn = switch_asn_dict[fabric_topology[switch_ip]["hostname"]]['asn']
     else:
-        intf_range = args.intf
-    if args.print_intf:
-        print("INFO: Printing only interface range:")
-        print(intf_range)
+        print(f'Error: Switch: {switch_ip} must have leaf or spine in its hostname ')
         return
 
-    intf_commands = f"""
-interface {intf_range}
-priority-flow-control mode on
-priority-flow-control watch-dog-interval on
-mtu 9216
-service-policy type qos input QOS_CLASSIFICATION
-no shutdown
-end
+    loopback_commands = f"""
+interface loopback0
+ ip address {loopback_ip}/32 tag 12345
+"""
+    router_commands = f"""
+router bgp {asn}
+ router-id {loopback_ip}
+ address-family ipv4 unicast
+  redistribute direct route-map redis-map
+  maximum-paths 128
+ address-family ipv6 unicast
+  redistribute direct route-map redis-map
+  maximum-paths 128
 """
 
-    commands = qos_commands + intf_commands
+    intf_dict = fabric_topology[switch_ip]["intf"]
+    neighbor_command = ''
+    intf_command = ''
+    for intf, intf_attr in intf_dict.items():
+        if 'mgmt' in intf:
+            continue
+        if 'switch' not in intf_attr["meta"]["neighbor_type"]:
+            continue
+        neighbor_asn = switch_asn_dict[intf_attr["meta"]["neighbor_name"]]['asn']
+        neighbor_command = neighbor_command + \
+                            f"""
+ neighbor {intf}
+  remote-as {neighbor_asn}
+  address-family ipv4 unicast
+  address-family ipv6 unicast
+"""
 
+        intf_command = intf_command + \
+                        f"""
+interface {intf}
+ ipv6 address use-link-local-only
+ ip forward
+"""
+
+    commands = global_commands + intf_command + loopback_commands + router_commands + neighbor_command + '\nend\n'
     if args.print_only:
         print('----------------------------------------')
         print(f"INFO: Switch: {switch_ip}: Following is the config in pretty format:\n")
@@ -148,13 +144,13 @@ end
         return
 
     try:
-        print(f"INFO: Switch: {switch_ip}: Trying to apply config...")
+        print(f"INFO: Switch: {switch_ip}: Trying to apply config by {switchuser}...")
         nxos_utils.run_cmd(args, commands, host_os, switch_ip, switchuser)
     except Exception as exc:
         print(f"Failed to apply configuration: {exc}")
         return
 
-def remove_config(args, host_os, switch_ip, switchuser):
+def remove_config(args, host_os, switch_ip, switchuser, switch_topology):
     if args.intf == "":
         intf_range = nxos_utils.build_interface_range(args, host_os, \
                                                       switch_ip, switchuser)
@@ -224,18 +220,27 @@ end
         print(f"Failed to remove configuration: {exc}")
         return
 
-def change_config(args, host_os, switch_ip, switchuser, x, xx):
+def change_config(args, host_os, switch_ip, switchuser, fabric_topology, switch_asn_dict):
     start_t = time.time()
     if args.disable:
-        remove_config(args, host_os, switch_ip, switchuser)
+        remove_config(args, host_os, switch_ip, switchuser, fabric_topology, switch_asn_dict)
     else:
-        apply_config(args, host_os, switch_ip, switchuser)
+        apply_config(args, host_os, switch_ip, switchuser, fabric_topology, switch_asn_dict)
     print(f"INFO: Switch: {switch_ip} took {round((time.time() - start_t), 2)}s")
 
 
 def main():
     args = parse_cmdline_arguments()
-    nxos_utils.common_worker(args, change_config, None)
+    host_os = nxos_utils.detect_host_os(args)
+    if host_os == 'linux':
+        switch_dict = {}
+        nxos_utils.get_switches(args, switch_dict)
+
+        # Discover the fabric using seed switch from the provided switch-file
+        if args.fabric:
+            fabric_topology = nxos_utils.get_fabric_topology(args, host_os, switch_dict)
+            switch_asn_dict = assign_bgp_asn(args, fabric_topology)
+    nxos_utils.common_worker(args, change_config, switch_asn_dict)
 
 if __name__ == "__main__":
     main()
