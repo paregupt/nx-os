@@ -30,7 +30,7 @@ def parse_cmdline_arguments():
                 formatter_class=argparse.RawDescriptionHelpFormatter,
                 )
 
-    base_parser.add_argument(
+    parser.add_argument(
         "--intf",
         type=str,
         default="",
@@ -40,13 +40,13 @@ def parse_cmdline_arguments():
             "Default: all Eth interfaces."
         ),
     )
-    base_parser.add_argument(
+    parser.add_argument(
         "--print-intf",
         default=False,
         action="store_true",
         help="Print all interface range. Do not apply config.",
     )
-    base_parser.add_argument(
+    parser.add_argument(
         "--fabric",
         default=False,
         action="store_true",
@@ -248,7 +248,7 @@ end
         print(f"Failed to remove configuration: {exc}")
         return
 
-def change_config(args, host_os, switch_ip, switchuser, x, xx):
+def change_config(args, host_os, switch_ip, switchuser, fabric_topology):
     start_t = time.time()
     if args.disable:
         remove_config(args, host_os, switch_ip, switchuser)
@@ -259,7 +259,13 @@ def change_config(args, host_os, switch_ip, switchuser, x, xx):
 
 def main():
     args = parse_cmdline_arguments()
-    nxos_utils.common_worker(args, change_config, None)
+    host_os = nxos_utils.detect_host_os(args)
+    switch_dict = {}
+    nxos_utils.get_switches(args, switch_dict)
+    fabric_topology = {}
+    if args.fabric:
+        fabric_topology = nxos_utils.get_fabric_topology(args, host_os, switch_dict)
+    nxos_utils.common_worker(args, change_config, host_os, switch_dict, fabric_topology)
 
 if __name__ == "__main__":
     main()

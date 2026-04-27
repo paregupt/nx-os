@@ -465,7 +465,11 @@ def common_worker(args, worker, host_os, switch_dict, fabric_topology):
             futures = {}
             for switch_ip, switch_attr in switch_dict.items():
                 switchuser = switch_attr['meta'][0]
-                print(f"INFO: Switch: {switch_ip} ({fabric_topology[switch_ip]['hostname']}): Starting to work...")
+                switchname = switch_attr['meta'][2]
+                if switch_ip in fabric_topology:
+                    if 'hostname' in fabric_topology[switch_ip]:
+                        switchname = fabric_topology[switch_ip]['hostname']
+                print(f"INFO: Switch: {switch_ip} ({switchname}): Starting to work...")
                 future = e.submit(worker, args, host_os, switch_ip, switchuser, fabric_topology)
                 futures[future] = switch_ip
 
@@ -487,7 +491,7 @@ def common_worker(args, worker, host_os, switch_dict, fabric_topology):
         '''
 
     elif host_os == 'nxos':
-        worker(args, host_os, 'local', None)
+        worker(args, host_os, 'local', None, None)
     else:
         print("ERROR: Unknown host OS")
     print('--------------------------------------------------------------------------------')
