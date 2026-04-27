@@ -7,10 +7,9 @@ python3 roce_enable.py --switch-file nexus_switches.txt
 """
 
 __author__ = "Paresh Gupta"
-__version__ = "0.50"
-__updated__ = "17-Apr-2026-1-PM-PDT"
+__version__ = "0.60"
+__updated__ = "26-Apr-2026-1-PM-PDT"
 
-import sys
 import argparse
 import time
 from utils import nxos_utils
@@ -31,6 +30,31 @@ def parse_cmdline_arguments():
                 formatter_class=argparse.RawDescriptionHelpFormatter,
                 )
 
+    base_parser.add_argument(
+        "--intf",
+        type=str,
+        default="",
+        help=(
+            "Interfaces to be modified. "
+            "Must be in NX-OS interface range format. "
+            "Default: all Eth interfaces."
+        ),
+    )
+    base_parser.add_argument(
+        "--print-intf",
+        default=False,
+        action="store_true",
+        help="Print all interface range. Do not apply config.",
+    )
+    base_parser.add_argument(
+        "--fabric",
+        default=False,
+        action="store_true",
+        help="Use the seed switch from the provided switch-file to discover "
+        "all switches in the fabric and then make change on all the switches. "
+        "The other approach would be to provide all switches in the switch-file"
+        " without this option set",
+    )
     parser.add_argument(
         "--pfc-cos",
         dest="pfc_cos",

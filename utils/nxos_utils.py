@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Applies or removes config on Cisco NX-OS for RoCEv2 traffic.
-Can run directly on the switch, like:
-n9k# python3 bootflash:roce_enable.py
-Or remotely on a Linux machine, like:
-python3 roce_enable.py --switch-file nexus_switches.txt
+"""Base utility fuctions for applying and removing config on Cisco NX-OS
 """
 
 __author__ = "Paresh Gupta"
@@ -14,7 +10,6 @@ import sys
 import subprocess
 import re
 import time
-import json
 import argparse
 import concurrent.futures
 from collections import deque
@@ -38,22 +33,6 @@ def get_base_parser():
         ),
     )
     base_parser.add_argument(
-        "--intf",
-        type=str,
-        default="",
-        help=(
-            "Interfaces to be modified. "
-            "Must be in NX-OS interface range format. "
-            "Default: all Eth interfaces."
-        ),
-    )
-    base_parser.add_argument(
-        "--print-intf",
-        default=False,
-        action="store_true",
-        help="Print all interface range. Do not apply config.",
-    )
-    base_parser.add_argument(
         "--disable",
         default=False,
         action="store_true",
@@ -70,15 +49,6 @@ def get_base_parser():
         choices=["auto", "nxos", "linux"],
         default="auto",
         help="Execution host: auto-detect (default), force nxos, or force linux.",
-    )
-    base_parser.add_argument(
-        "--fabric",
-        default=False,
-        action="store_true",
-        help="Use the seed switch from the provided switch-file to discover "
-        "all switches in the fabric and then make change on all the switches. "
-        "The other approach would be to provide all switches in the switch-file"
-        " without this option set",
     )
     base_parser.add_argument(
         "-v",
@@ -284,23 +254,22 @@ def build_interface_range(args, host_os, switch_ip, switchuser):
 
 def parse_cdp_neighbors(cdp_out):
     """Parse CLI output to extract neighbor IP addresses."""
-    neighbors = set()
     sub_section = ''.join(re.findall(r'Mgmt address.*\n.*\n', cdp_out, re.IGNORECASE))
     matches = re.findall(r'IPv4 Address:[ ]{1,}(.*)', sub_section, re.IGNORECASE)
 
     return set(matches)
-    '''
-    matches = ip_regex.findall(output)
-    for match in matches:
-        neighbors.add(match)
-    return neighbors
-    '''
 
 def parse_lldp_neighbors(lldp_out):
     """Parse CLI output to extract neighbor IP addresses."""
     neighbors = set()
     matches = re.findall(r'Management Address:[ ]{1,}(.*)', lldp_out, re.IGNORECASE)
     return set(matches)
+
+def normalize_intf_str(intf_str):
+    ret_str = intf_str.lower()
+    if 'ethernet' in ret_str:
+        ret_str = ret_str.replace('ethernet', 'eth')
+    return ret_str
 
 def populate_intf_dict(args, intf_dict, cdp_out, lldp_out):
     # Populate intf dictionary with neighbor information
@@ -320,6 +289,8 @@ def populate_intf_dict(args, intf_dict, cdp_out, lldp_out):
                             section, re.IGNORECASE))
         neighbor_intf = ''.join(re.findall(r'Port ID .*:[ ]{1,}(.*)',
                             section, re.IGNORECASE))
+        local_intf = normalize_intf_str(local_intf)
+        neighbor_intf = normalize_intf_str(neighbor_intf)
 
         neighbor_type = 'other'
         if re.search('Switch', section, re.IGNORECASE):
@@ -337,7 +308,7 @@ def populate_intf_dict(args, intf_dict, cdp_out, lldp_out):
         meta_dict['neighbor_intf'] = neighbor_intf
         meta_dict['neighbor_type'] = neighbor_type
 
-        if args.verbose:
+        if args.more_verbose:
             print(f"CDP: {local_intf}, {neighbor_name}, {neighbor_address}, {neighbor_intf}, {neighbor_type}")
     # now allow LLDP to take precedence over CDP
     for section in lldp_out.split('\n\n'):
@@ -368,6 +339,9 @@ def populate_intf_dict(args, intf_dict, cdp_out, lldp_out):
             neighbor_type = 'other'
             neighbor_intf = 'unknown'
 
+        local_intf = normalize_intf_str(local_intf)
+        neighbor_intf = normalize_intf_str(neighbor_intf)
+
         if local_intf not in intf_dict:
             intf_dict[local_intf] = {}
         per_intf_dict = intf_dict[local_intf]
@@ -379,7 +353,7 @@ def populate_intf_dict(args, intf_dict, cdp_out, lldp_out):
         meta_dict['neighbor_address'] = neighbor_address
         meta_dict['neighbor_intf'] = neighbor_intf
         meta_dict['neighbor_type'] = neighbor_type
-        if args.verbose:
+        if args.more_verbose:
             print(f"LLDP: {local_intf}, {neighbor_name}, {neighbor_address}, {neighbor_intf}, {neighbor_type}")
 
 def discover_fabric(args, host_os, switch_ip, switchuser, max_depth=5):
@@ -400,7 +374,6 @@ def discover_fabric(args, host_os, switch_ip, switchuser, max_depth=5):
             continue
 
         visited.add(current_ip)
-        print(f"[{depth}/{max_depth}] Discovering {current_ip}...")
 
         # Get Hostname
         output = run_cmd(args, 'show hostname', host_os, current_ip, switchuser)
@@ -408,6 +381,8 @@ def discover_fabric(args, host_os, switch_ip, switchuser, max_depth=5):
             print(f"Error: Unable to get hostname from {current_ip}")
             continue
         hostname = output
+
+        print(f"INFO: [{depth}/{max_depth}] Discovering {current_ip}({hostname})...")
 
         # Run CDP and LLDP commands
         cdp_cmd = "show cdp neighbors detail"
@@ -447,8 +422,9 @@ def discover_fabric(args, host_os, switch_ip, switchuser, max_depth=5):
 
         for intf, intf_attr in intf_dict.items():
             if 'switch' not in intf_attr["meta"]["neighbor_type"]:
-                neighbor_ip = intf_attr["meta"]["neighbor_address"]
-                all_neighbors.remove(neighbor_ip)
+                neighbor_address = intf_attr["meta"]["neighbor_address"]
+                if neighbor_address in all_neighbors:
+                    all_neighbors.remove(neighbor_address)
 
         # Add new neighbors to the queue
         for neighbor_ip in all_neighbors:
@@ -459,17 +435,7 @@ def discover_fabric(args, host_os, switch_ip, switchuser, max_depth=5):
 
 def discover_fabric_topology(args, host_os, switch_ip, switchuser):
     fabric_topology = discover_fabric(args, host_os, switch_ip, switchuser, max_depth=5)
-    time_str = time.strftime("%Y-%m-%d-%H-%M-%S")
-    output_filename = "nxos_fabric_topology_" + time_str + ".json"
-    print(f"--- Discovery Complete ---")
-
-    with open(output_filename, 'w') as f:
-        json.dump(fabric_topology, f, indent=2)
-
-    if args.more_verbose:
-        print(f"{output_filename}:")
-        print(json.dumps(fabric_topology, indent=2))
-
+    print("--- Discovery Complete ---")
     return fabric_topology
 
 def get_fabric_topology(args, host_os, switch_dict):
@@ -489,43 +455,36 @@ def get_fabric_topology(args, host_os, switch_dict):
 
     return fabric_topology
 
-def common_worker(args, worker, worker_arg):
-    host_os = detect_host_os(args)
+def common_worker(args, worker, host_os, switch_dict, fabric_topology):
 
     start_t = time.time()
     print('--------------------------------------------------------------------------------')
     if host_os == 'linux':
-        switch_dict = {}
-        get_switches(args, switch_dict)
 
-        # Discover the fabric using seed switch from the provided switch-file
-        if args.fabric:
-            fabric_topology = get_fabric_topology(args, host_os, switch_dict)
-
-        '''
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(switch_dict)) as e:
             futures = {}
             for switch_ip, switch_attr in switch_dict.items():
                 switchuser = switch_attr['meta'][0]
-                switchpassword = switch_attr['meta'][1]
-                print(f"INFO: Switch: {switch_ip} ({switch_attr['meta'][2]}): Starting to work...")
-                future = e.submit(worker, args, host_os, switch_ip, switchuser, fabric_topology[switch_ip])
+                print(f"INFO: Switch: {switch_ip} ({fabric_topology[switch_ip]['hostname']}): Starting to work...")
+                future = e.submit(worker, args, host_os, switch_ip, switchuser, fabric_topology)
                 futures[future] = switch_ip
 
             for future in concurrent.futures.as_completed(futures):
                 switch_ip = futures[future]
                 try:
                     result = future.result()  # This will raise any exception that occurred
-                    print(f"INFO: Switch: {switch_ip}: Completed successfully")
+                    print(f"INFO: Switch: {switch_ip}: Completed successfully: {result}")
                 except Exception as exc:
                     print(f"Switch: {switch_ip}: Generated an exception: {exc}")
+
         '''
 
         # Following is a non-multithreaded way
         for switch_ip, switch_attr in switch_dict.items():
             switchuser = switch_attr['meta'][0]
-            print(f"INFO: Switch: {switch_ip} ({switch_attr['meta'][2]}): Starting to work...")
-            worker(args, host_os, switch_ip, switchuser, fabric_topology, worker_arg)
+            print(f"INFO: Switch: {switch_ip} ({fabric_topology[switch_ip]['hostname']}): Starting to work...")
+            worker(args, host_os, switch_ip, switchuser, fabric_topology)
+        '''
 
     elif host_os == 'nxos':
         worker(args, host_os, 'local', None)
